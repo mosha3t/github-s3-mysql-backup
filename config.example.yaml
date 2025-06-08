@@ -1,0 +1,43 @@
+# ============================================================
+#  Cloud Backup — Configuration
+#  Fill in your credentials below, then build the app.
+#  On first run, this file will be encrypted and deleted.
+# ============================================================
+
+# Where to store all backups
+backup_directory: ~/Desktop/Cloud Backups
+
+# ── Database ────────────────────────────────────────────────
+# Supports MySQL and SQL Server. Use a READ-ONLY user!
+database:
+  enabled: true
+  type: "mysql"                    # "mysql" or "sqlserver"
+  host: "your-db-host.example.com"
+  port: 3306
+  username: "backup_readonly"
+  password: "your_password_here"
+  # Leave empty to auto-discover all databases:
+  databases: []
+
+# ── Amazon S3 ──────────────────────────────────────────────
+# Use an IAM user with AmazonS3ReadOnlyAccess policy
+s3:
+  enabled: true
+  aws_access_key_id: "AKIA..."
+  aws_secret_access_key: "your_secret_key_here"
+  region: "us-east-1"
+  # List the S3 buckets you want to back up:
+  buckets:
+    - "my-bucket-1"
+    - "my-bucket-2"
+
+# ── GitHub ─────────────────────────────────────────────────
+# Create a token at: https://github.com/settings/tokens
+# It needs the "repo" scope for private repos
+github:
+  enabled: true
+  personal_access_token: "ghp_your_token_here"
+  # The GitHub Organization or Username whose repos to back up:
+  organization: "your-org-or-username"
+  # Set to true to also back up private repos
+  include_private: true

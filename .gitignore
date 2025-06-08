@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+._*
+
+# App bundle (built from source)
+*.app/
+
+# Config with real credentials
+config.yaml
+
+# Encrypted config
+.config.enc
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual env
+venv/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
