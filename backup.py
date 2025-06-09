@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Cloud Backup Tool
-Backs up MySQL databases with full schema + data dumps.
+Backs up MySQL and SQL Server databases with schema and data dumps.
 """
 
 import os, sys, subprocess, datetime, traceback, argparse
 from pathlib import Path
 
-REQUIRED = {"yaml":"pyyaml","pymysql":"pymysql"}
+REQUIRED = {"yaml":"pyyaml", "pymysql":"pymysql", "pymssql":"pymssql"}
 
 def ensure_deps():
     missing = [p for i,p in REQUIRED.items() if not _can_import(i)]
@@ -23,6 +23,7 @@ ensure_deps()
 
 import yaml
 import pymysql
+import pymssql
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -43,14 +44,15 @@ def err(m): print(f"  ❌  {C.R}{m}{C.X}")
 def info(m): print(f"  ℹ️   {C.D}{m}{C.X}")
 def section(t): print(f"\n{C.B}{C.CN}── {t} {'─'*(55-len(t))}{C.X}\n")
 
-def backup_mysql(cfg, backup_dir):
+def backup_database(cfg, backup_dir):
     section("Database Backup")
     dc = cfg.get("database", {})
     if not dc or not dc.get("enabled", False):
         info("Database backup disabled."); return True
 
+    tp = dc.get("type", "mysql").lower().strip()
     host = dc.get("host","")
-    port = dc.get("port", 3306)
+    port = dc.get("port", 3306 if tp=="mysql" else 1433)
     user = dc.get("username","")
     pw = dc.get("password","")
     dbs = dc.get("databases",[])
@@ -58,9 +60,15 @@ def backup_mysql(cfg, backup_dir):
     if not host or not user or not pw:
         err("Database credentials missing."); return False
 
-    info(f"Host: {C.B}{host}:{port}{C.X}")
+    info(f"Type: {C.B}{tp.upper()}{C.X}  Host: {C.B}{host}:{port}{C.X}")
     d = backup_dir/"database"; d.mkdir(parents=True,exist_ok=True)
 
+    if tp == "mysql":
+        return _mysql(host, port, user, pw, dbs, d)
+    else:
+        return _mssql(host, port, user, pw, dbs, d)
+
+def _mysql(host, port, user, pw, dbs, out_dir):
     aok=True
     try:
         c=pymysql.connect(host=host,port=int(port),user=user,password=pw,
@@ -78,7 +86,7 @@ def backup_mysql(cfg, backup_dir):
 
     for db in dbs:
         info(f"Backing up: {C.B}{db}{C.X}")
-        of = d/f"{db}.sql"
+        of = out_dir/f"{db}.sql"
         try:
             cn=pymysql.connect(host=host,port=int(port),user=user,password=pw,
                                database=db,connect_timeout=15,charset="utf8mb4")
@@ -116,13 +124,49 @@ def backup_mysql(cfg, backup_dir):
                                     else:
                                         e=str(v).replace("\\","\\\\").replace("'","\\'")
                                         vs.append(f"'{e}'")
-                                rs.append(f"({', '.join(vs)})")
+                                 rs.append(f"({', '.join(vs)})")
                             f.write(",\n".join(rs)+";\n")
 
                 f.write("\nSET FOREIGN_KEY_CHECKS=1;\n")
 
             cr.execute("COMMIT")
             ok(f"{db} → {of.name} ({human(of.stat().st_size)}, {len(tables)} tables)")
+            cn.close()
+        except Exception as e:
+            err(f"Failed: {db}: {e}"); aok=False
+    return aok
+
+def _mssql(host, port, user, pw, dbs, out_dir):
+    if not dbs:
+        warn("No databases listed for SQL Server."); return True
+    aok=True
+    for db in dbs:
+        info(f"Backing up: {C.B}{db}{C.X}")
+        of=out_dir/f"{db}.sql"
+        try:
+            cn=pymssql.connect(server=host,port=str(port),user=user,password=pw,database=db)
+            cr=cn.cursor()
+            cr.execute("SELECT TABLE_SCHEMA,TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' ORDER BY 1,2")
+            tables=cr.fetchall()
+            with open(of,"w",encoding="utf-8") as f:
+                f.write(f"-- Cloud Backup — SQL Server — {db}\n-- {datetime.datetime.now().isoformat()}\n\n")
+                for s,t in tables:
+                    fn=f"[{s}].[{t}]"
+                    cr.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s ORDER BY ORDINAL_POSITION",(s,t))
+                    cols=[r[0] for r in cr.fetchall()]
+                    cl=", ".join(f"[{c}]" for c in cols)
+                    f.write(f"\n-- {fn}\n")
+                    cr.execute(f"SELECT * FROM {fn}")
+                    for row in cr.fetchall():
+                        vs=[]
+                        for v in row:
+                            if v is None: vs.append("NULL")
+                            elif isinstance(v,(int,float)): vs.append(str(v))
+                            elif isinstance(v,bytes): vs.append(f"0x{v.hex()}")
+                            elif isinstance(v,datetime.datetime): vs.append(f"'{v.isoformat()}'")
+                            else: vs.append(f"'{str(v).replace(chr(39),chr(39)+chr(39))}'")
+                        f.write(f"INSERT INTO {fn} ({cl}) VALUES ({', '.join(vs)});\n")
+            ok(f"{db} → {of.name} ({human(of.stat().st_size)})")
             cn.close()
         except Exception as e:
             err(f"Failed: {db}: {e}"); aok=False
@@ -142,7 +186,7 @@ def main():
     bdir=base/ts(); bdir.mkdir(parents=True,exist_ok=True)
     info(f"Backup folder: {bdir}")
 
-    result = backup_mysql(cfg, bdir)
+    result = backup_database(cfg, bdir)
 
     if result: print(f"\n{C.G}{C.B}  Done!{C.X}\n")
     else: print(f"\n{C.Y}{C.B}  Completed with errors.{C.X}\n")
