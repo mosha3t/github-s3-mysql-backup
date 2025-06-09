@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Cloud Backup Tool
-Backs up MySQL and SQL Server databases with schema and data dumps.
+Backs up MySQL, SQL Server, and Amazon S3 buckets.
 """
 
 import os, sys, subprocess, datetime, traceback, argparse
 from pathlib import Path
 
-REQUIRED = {"yaml":"pyyaml", "pymysql":"pymysql", "pymssql":"pymssql"}
+REQUIRED = {"yaml":"pyyaml", "pymysql":"pymysql", "pymssql":"pymssql", "boto3":"boto3"}
 
 def ensure_deps():
     missing = [p for i,p in REQUIRED.items() if not _can_import(i)]
@@ -24,6 +24,7 @@ ensure_deps()
 import yaml
 import pymysql
 import pymssql
+import boto3
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -37,6 +38,12 @@ def human(n):
         if abs(n)<1024: return f"{n:.1f} {u}"
         n/=1024
     return f"{n:.1f} PB"
+
+def dsize(p):
+    t=0
+    for f in p.rglob("*"):
+        if f.is_file(): t+=f.stat().st_size
+    return t
 
 def ok(m): print(f"  ✅  {C.G}{m}{C.X}")
 def warn(m): print(f"  ⚠️   {C.Y}{m}{C.X}")
@@ -172,6 +179,41 @@ def _mssql(host, port, user, pw, dbs, out_dir):
             err(f"Failed: {db}: {e}"); aok=False
     return aok
 
+def backup_s3(cfg, backup_dir):
+    section("Amazon S3 Backup")
+    sc=cfg.get("s3",{})
+    if not sc or not sc.get("enabled",False):
+        info("S3 disabled. Skipping."); return True
+
+    ak,sk=sc.get("aws_access_key_id",""),sc.get("aws_secret_access_key","")
+    rg=sc.get("region","us-east-1"); bkts=sc.get("buckets",[])
+    if not ak or not sk:
+        err("AWS keys missing."); return False
+    if not bkts:
+        warn("No buckets listed."); return True
+
+    sd=backup_dir/"s3"; sd.mkdir(parents=True,exist_ok=True)
+    s3=boto3.Session(aws_access_key_id=ak,aws_secret_access_key=sk,region_name=rg).client("s3")
+
+    aok=True
+    for bk in bkts:
+        info(f"Syncing: {C.B}{bk}{C.X}")
+        bd=sd/bk; bd.mkdir(parents=True,exist_ok=True)
+        try:
+            pg=s3.get_paginator("list_objects_v2"); fc=0; tb=0
+            for page in pg.paginate(Bucket=bk):
+                for obj in page.get("Contents",[]):
+                    k,sz=obj["Key"],obj["Size"]
+                    if k.endswith("/") and sz==0: continue
+                    lp=bd/k; lp.parent.mkdir(parents=True,exist_ok=True)
+                    if lp.exists() and lp.stat().st_size==sz: continue
+                    s3.download_file(bk,k,str(lp)); fc+=1; tb+=sz
+                    if fc%50==0: info(f"  {fc} files ({human(tb)})")
+            ok(f"{bk} → {fc} new/updated files (total: {human(dsize(bd))})")
+        except Exception as e:
+            err(f"Failed: {bk}: {e}"); aok=False
+    return aok
+
 def main():
     print(f"\n{C.CN}{C.B}  Cloud Backup Tool{C.X}\n")
 
@@ -186,7 +228,10 @@ def main():
     bdir=base/ts(); bdir.mkdir(parents=True,exist_ok=True)
     info(f"Backup folder: {bdir}")
 
-    result = backup_database(cfg, bdir)
+    db_res = backup_database(cfg, bdir)
+    s3_res = backup_s3(cfg, bdir)
+
+    result = db_res and s3_res
 
     if result: print(f"\n{C.G}{C.B}  Done!{C.X}\n")
     else: print(f"\n{C.Y}{C.B}  Completed with errors.{C.X}\n")
