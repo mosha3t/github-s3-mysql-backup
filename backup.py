@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Cloud Backup Tool
-Backs up MySQL, SQL Server, and Amazon S3 buckets.
+Backs up MySQL, SQL Server, Amazon S3, and GitHub repositories.
 """
 
-import os, sys, subprocess, datetime, traceback, argparse
+import os, sys, shutil, subprocess, datetime, traceback, argparse
 from pathlib import Path
 
-REQUIRED = {"yaml":"pyyaml", "pymysql":"pymysql", "pymssql":"pymssql", "boto3":"boto3"}
+REQUIRED = {"yaml":"pyyaml", "pymysql":"pymysql", "pymssql":"pymssql", "boto3":"boto3", "requests":"requests"}
 
 def ensure_deps():
     missing = [p for i,p in REQUIRED.items() if not _can_import(i)]
@@ -25,6 +25,7 @@ import yaml
 import pymysql
 import pymssql
 import boto3
+import requests
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -214,6 +215,96 @@ def backup_s3(cfg, backup_dir):
             err(f"Failed: {bk}: {e}"); aok=False
     return aok
 
+def backup_github(cfg, backup_dir):
+    section("GitHub Repos Backup")
+    gc=cfg.get("github",{})
+    if not gc or not gc.get("enabled",False):
+        info("GitHub disabled. Skipping."); return True
+
+    tok=gc.get("personal_access_token",""); org=gc.get("organization","")
+    if not tok:
+        err("GitHub token missing."); return False
+    if not org:
+        err("GitHub org/user missing."); return False
+    if not shutil.which("git"):
+        err("git not installed."); return False
+
+    gd=backup_dir/"github"/org; gd.mkdir(parents=True,exist_ok=True)
+    hd={"Authorization":f"token {tok}","Accept":"application/vnd.github.v3+json"}
+
+    repos=[]; pg=1
+    url=f"https://api.github.com/orgs/{org}/repos"
+    test=requests.get(url,headers=hd,params={"per_page":1})
+    if test.status_code!=404:
+        info(f"'{org}' is an organization.")
+    else:
+        me=requests.get("https://api.github.com/user",headers=hd)
+        if me.status_code==200 and me.json().get("login","").lower()==org.lower():
+            url=f"https://api.github.com/user/repos"
+            info(f"'{org}' is your own account (includes private repos).")
+        else:
+            url=f"https://api.github.com/users/{org}/repos"
+            info(f"'{org}' is a user account.")
+
+    while True:
+        params={"per_page":100,"page":pg}
+        if "/user/repos" in url:
+            params["affiliation"]="owner"
+        else:
+            params["type"]="all"
+        r=requests.get(url,headers=hd,params=params)
+        if r.status_code!=200:
+            err(f"GitHub API: {r.json().get('message',r.text)}"); return False
+        rp=r.json()
+        if not rp: break
+        repos.extend(rp); pg+=1
+
+    if not repos:
+        warn(f"No repos for '{org}'."); return True
+    if not gc.get("include_private",True):
+        repos=[r for r in repos if not r.get("private",False)]
+
+    info(f"Found {len(repos)} repo(s).")
+    aok=True; cloned=0; updated=0
+
+    for repo in repos:
+        nm=repo["name"]
+        au=repo["clone_url"].replace("https://",f"https://{tok}@")
+        rd=gd/nm
+        try:
+            if rd.exists() and (rd/".git").exists():
+                info(f"Updating: {nm}")
+                subprocess.run(["git","-C",str(rd),"remote","set-url","origin",au], capture_output=True,text=True,timeout=30)
+                subprocess.run(["git","-C",str(rd),"fetch","--all","--prune"], capture_output=True,text=True,timeout=120)
+                subprocess.run(["git","-C",str(rd),"pull","--ff-only"], capture_output=True,text=True,timeout=60)
+                updated+=1
+            else:
+                info(f"Cloning: {nm}...")
+                if rd.exists(): shutil.rmtree(rd)
+                r=subprocess.run(["git","clone",au,str(rd)], capture_output=True,text=True,timeout=300)
+                if r.returncode!=0:
+                    err(f"Failed: {nm}: {r.stderr.strip()[:100]}"); aok=False; continue
+                cloned+=1
+
+            br=subprocess.run(["git","-C",str(rd),"branch","-r"], capture_output=True,text=True,timeout=10)
+            branches=[]
+            for line in br.stdout.strip().split("\n"):
+                b=line.strip()
+                if not b or "HEAD" in b: continue
+                local=b.replace("origin/","")
+                branches.append(local)
+                subprocess.run(["git","-C",str(rd),"branch","--track",local,b], capture_output=True,text=True,timeout=10)
+
+            info(f"  {nm}: {len(branches)} branch(es) — {', '.join(branches[:5])}{'...' if len(branches)>5 else ''}")
+
+        except subprocess.TimeoutExpired:
+            err(f"Timeout: {nm}"); aok=False
+        except Exception as e:
+            err(f"{nm}: {e}"); aok=False
+
+    ok(f"GitHub: {cloned} cloned, {updated} updated ({len(repos)} total)")
+    return aok
+
 def main():
     print(f"\n{C.CN}{C.B}  Cloud Backup Tool{C.X}\n")
 
@@ -230,8 +321,9 @@ def main():
 
     db_res = backup_database(cfg, bdir)
     s3_res = backup_s3(cfg, bdir)
+    gh_res = backup_github(cfg, bdir)
 
-    result = db_res and s3_res
+    result = db_res and s3_res and gh_res
 
     if result: print(f"\n{C.G}{C.B}  Done!{C.X}\n")
     else: print(f"\n{C.Y}{C.B}  Completed with errors.{C.X}\n")
