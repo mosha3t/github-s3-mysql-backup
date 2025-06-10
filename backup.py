@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
 Cloud Backup Tool
-Backs up MySQL, SQL Server, Amazon S3, and GitHub repositories.
+Self-contained backup for MySQL, SQL Server, Amazon S3, and GitHub repos.
+Encrypted config stored securely in ~/.cloud-backup/
 """
 
 import os, sys, shutil, subprocess, datetime, traceback, argparse
+import json, hashlib, base64, getpass
 from pathlib import Path
 
-REQUIRED = {"yaml":"pyyaml", "pymysql":"pymysql", "pymssql":"pymssql", "boto3":"boto3", "requests":"requests"}
+REQUIRED = {
+    "yaml": "pyyaml",
+    "pymysql": "pymysql",
+    "pymssql": "pymssql",
+    "boto3": "boto3",
+    "requests": "requests",
+    "cryptography": "cryptography"
+}
 
 def ensure_deps():
     missing = [p for i,p in REQUIRED.items() if not _can_import(i)]
     if missing:
-        print(f"Installing: {', '.join(missing)} ...")
+        print(f"📦 Installing: {', '.join(missing)} ...")
         subprocess.check_call([sys.executable,"-m","pip","install","--quiet"]+missing)
+        print("   ✅ Done.\n")
 
 def _can_import(name):
     try: __import__(name); return True
@@ -26,12 +36,34 @@ import pymysql
 import pymssql
 import boto3
 import requests
+from cryptography.fernet import Fernet, InvalidToken
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+DATA_DIR = Path.home() / ".cloud-backup"
+CONFIG_ENC = DATA_DIR / ".config.enc"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+if SCRIPT_DIR.name == "Resources" and SCRIPT_DIR.parent.name == "Contents":
+    APP_DIR = SCRIPT_DIR.parent.parent.parent
+else:
+    APP_DIR = SCRIPT_DIR
+IMPORT_CONFIG = APP_DIR / "config.yaml"
 
+# ---------------------------------------------------------------------------
+# Colors & Console Output
+# ---------------------------------------------------------------------------
 class C:
     G="\033[92m"; Y="\033[93m"; R="\033[91m"; CN="\033[96m"
     B="\033[1m"; D="\033[2m"; X="\033[0m"
+
+def banner():
+    print(f"""
+{C.CN}{C.B}╔══════════════════════════════════════════════════════════════╗
+║                  CLOUD BACKUP TOOL                           ║
+╚══════════════════════════════════════════════════════════════╝{C.X}
+""")
 
 def ts(): return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 def human(n):
@@ -46,12 +78,85 @@ def dsize(p):
         if f.is_file(): t+=f.stat().st_size
     return t
 
-def ok(m): print(f"  ✅  {C.G}{m}{C.X}")
-def warn(m): print(f"  ⚠️   {C.Y}{m}{C.X}")
-def err(m): print(f"  ❌  {C.R}{m}{C.X}")
-def info(m): print(f"  ℹ️   {C.D}{m}{C.X}")
+def status(e,m): print(f"  {e}  {m}")
 def section(t): print(f"\n{C.B}{C.CN}── {t} {'─'*(55-len(t))}{C.X}\n")
+def ok(m): status("✅",f"{C.G}{m}{C.X}")
+def warn(m): status("⚠️ ",f"{C.Y}{m}{C.X}")
+def err(m): status("❌",f"{C.R}{m}{C.X}")
+def info(m): status("ℹ️ ",f"{C.D}{m}{C.X}")
 
+# ---------------------------------------------------------------------------
+# Encryption
+# ---------------------------------------------------------------------------
+def _key(pw, salt):
+    return base64.urlsafe_b64encode(hashlib.pbkdf2_hmac("sha256",pw.encode(),salt,100000))
+
+def encrypt_and_store(cfg_text: bytes, password: str):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    salt = os.urandom(16)
+    f = Fernet(_key(password, salt))
+    enc = f.encrypt(cfg_text)
+    payload = base64.b64encode(salt).decode() + ":" + enc.decode()
+    CONFIG_ENC.write_text(payload)
+
+def decrypt_config(password: str) -> dict:
+    payload = CONFIG_ENC.read_text()
+    salt_b64, enc = payload.split(":", 1)
+    salt = base64.b64decode(salt_b64)
+    f = Fernet(_key(password, salt))
+    decrypted = f.decrypt(enc.encode())
+    return yaml.safe_load(decrypted.decode())
+
+# ---------------------------------------------------------------------------
+# Config Loading with Password Flow
+# ---------------------------------------------------------------------------
+def load_config_with_password() -> dict:
+    if CONFIG_ENC.exists():
+        print(f"  {C.B}🔒 Config is encrypted.{C.X}")
+        for attempt in range(3):
+            pw = getpass.getpass("  Enter your backup password: ")
+            try:
+                cfg = decrypt_config(pw)
+                ok("Config unlocked.")
+                return cfg
+            except (InvalidToken, Exception):
+                if attempt < 2:
+                    err("Wrong password. Try again.")
+                else:
+                    err("3 wrong attempts. Exiting.")
+                    sys.exit(1)
+
+    if IMPORT_CONFIG.exists():
+        print(f"  {C.B}📋 First-time setup{C.X}")
+        print(f"  Found config.yaml — will encrypt and secure it.\n")
+
+        pw = getpass.getpass("  🔑 Set a password: ")
+        pw2 = getpass.getpass("  🔑 Confirm password: ")
+        if pw != pw2:
+            err("Passwords don't match. Run the app again.")
+            sys.exit(1)
+
+        cfg_bytes = IMPORT_CONFIG.read_bytes()
+        cfg = yaml.safe_load(cfg_bytes.decode())
+
+        encrypt_and_store(cfg_bytes, pw)
+        IMPORT_CONFIG.unlink()
+
+        print()
+        ok("Config encrypted and stored securely.")
+        ok(f"Location: {CONFIG_ENC}")
+        ok("config.yaml has been deleted.")
+        info("You'll need this password every time you run a backup.\n")
+        return cfg
+
+    err("No configuration found!")
+    err(f"Please place config.yaml next to 'Cloud Backup.app' and run again.")
+    err(f"Expected location: {IMPORT_CONFIG}")
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Backup Services
+# ---------------------------------------------------------------------------
 def backup_database(cfg, backup_dir):
     section("Database Backup")
     dc = cfg.get("database", {})
@@ -306,14 +411,11 @@ def backup_github(cfg, backup_dir):
     return aok
 
 def main():
-    print(f"\n{C.CN}{C.B}  Cloud Backup Tool{C.X}\n")
+    banner()
 
-    cfg_path = SCRIPT_DIR / "config.yaml"
-    if not cfg_path.exists():
-        err(f"config.yaml not found at {SCRIPT_DIR}"); return 1
-
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
+    # Load config (handles password prompt internally)
+    cfg = load_config_with_password()
+    print()
 
     base=Path(cfg.get("backup_directory","~/Desktop/Cloud Backups")).expanduser()
     bdir=base/ts(); bdir.mkdir(parents=True,exist_ok=True)
