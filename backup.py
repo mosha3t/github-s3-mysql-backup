@@ -410,6 +410,11 @@ def backup_github(cfg, backup_dir):
     ok(f"GitHub: {cloned} cloned, {updated} updated ({len(repos)} total)")
     return aok
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+SVCMAP = {"db": "Database", "s3": "Amazon S3", "github": "GitHub"}
+
 def main():
     banner()
 
@@ -417,21 +422,88 @@ def main():
     cfg = load_config_with_password()
     print()
 
-    base=Path(cfg.get("backup_directory","~/Desktop/Cloud Backups")).expanduser()
-    bdir=base/ts(); bdir.mkdir(parents=True,exist_ok=True)
-    info(f"Backup folder: {bdir}")
+    # Service selection
+    parser = argparse.ArgumentParser(description="Cloud Backup Tool")
+    parser.add_argument("--only", nargs="+", choices=["db", "s3", "github"], metavar="SVC")
+    args = parser.parse_args()
 
-    db_res = backup_database(cfg, bdir)
-    s3_res = backup_s3(cfg, bdir)
-    gh_res = backup_github(cfg, bdir)
+    if args.only:
+        sel = args.only
+    elif sys.stdin.isatty():
+        print(f"  {C.B}What would you like to back up?{C.X}\n")
+        print(f"    {C.CN}1{C.X})  Everything")
+        print(f"    {C.CN}2{C.X})  Database only")
+        print(f"    {C.CN}3{C.X})  Amazon S3 only")
+        print(f"    {C.CN}4{C.X})  GitHub repos only")
+        print(f"    {C.CN}5{C.X})  Pick multiple (e.g. 2,3)\n")
+        ch = input("  Choice [1]: ").strip() or "1"
+        mm = {"1": None, "2": ["db"], "3": ["s3"], "4": ["github"]}
+        if ch in mm:
+            sel = mm[ch]
+        else:
+            nk = {"2": "db", "3": "s3", "4": "github"}
+            sel = [nk[p.strip()] for p in ch.split(",") if p.strip() in nk] or None
+        print()
+    else:
+        sel = None
 
-    result = db_res and s3_res and gh_res
+    rdb = rs3 = rgh = True
+    if sel:
+        rdb = "db" in sel
+        rs3 = "s3" in sel
+        rgh = "github" in sel
+        info(f"Selected: {', '.join(SVCMAP[k] for k in sel)}")
+    else:
+        info("Running all enabled services.")
 
-    if result: print(f"\n{C.G}{C.B}  Done!{C.X}\n")
-    else: print(f"\n{C.Y}{C.B}  Completed with errors.{C.X}\n")
-    return 0 if result else 1
+    base = Path(cfg.get("backup_directory", "~/Desktop/Cloud Backups")).expanduser()
+    bdir = base / ts()
+    bdir.mkdir(parents=True, exist_ok=True)
+
+    print(f"  📂  Folder: {C.B}{bdir}{C.X}")
+    print(f"  🕐  Started: {C.B}{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{C.X}")
+
+    res = {}
+    if rdb:
+        res["Database"] = backup_database(cfg, bdir)
+    if rs3:
+        res["Amazon S3"] = backup_s3(cfg, bdir)
+    if rgh:
+        res["GitHub"] = backup_github(cfg, bdir)
+
+    # Summary
+    section("Summary")
+    tsz = human(dsize(bdir))
+    print(f"  📦  Size: {C.B}{tsz}{C.X}")
+    print(f"  📂  Location: {bdir}\n")
+
+    ap = True
+    for s, v in res.items():
+        if v:
+            ok(f"{s}: OK")
+        else:
+            err(f"{s}: FAILED")
+            ap = False
+
+    ln = base / "latest"
+    if ln.is_symlink() or ln.exists():
+        ln.unlink()
+    ln.symlink_to(bdir)
+
+    if ap:
+        print(f"\n{C.G}{C.B}  🎉  All backups completed!{C.X}\n")
+    else:
+        print(f"\n{C.Y}{C.B}  ⚠️   Some errors. Check above.{C.X}\n")
+
+    (bdir / "backup_log.txt").write_text(
+        f"Cloud Backup — {datetime.datetime.now().isoformat()}\n" +
+        "".join(f"  {s}: {'OK' if v else 'FAIL'}\n" for s, v in res.items()) +
+        f"Size: {tsz}\n"
+    )
+
+    return 0 if ap else 1
 
 if __name__=="__main__":
     try: sys.exit(main())
-    except KeyboardInterrupt: print("\nCancelled."); sys.exit(130)
-    except Exception as e: print(f"\nError: {e}"); traceback.print_exc(); sys.exit(1)
+    except KeyboardInterrupt: print(f"\n{C.Y}Cancelled.{C.X}"); sys.exit(130)
+    except Exception as e: print(f"\n{C.R}Error: {e}{C.X}"); traceback.print_exc(); sys.exit(1)
