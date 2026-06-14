@@ -237,7 +237,7 @@ def _mysql(host, port, user, pw, dbs, out_dir):
                                     else:
                                         e=str(v).replace("\\","\\\\").replace("'","\\'")
                                         vs.append(f"'{e}'")
-                                 rs.append(f"({', '.join(vs)})")
+                                rs.append(f"({', '.join(vs)})")
                             f.write(",\n".join(rs)+";\n")
 
                 f.write("\nSET FOREIGN_KEY_CHECKS=1;\n")
